@@ -48,6 +48,7 @@ const ALLOWED_HOSTS = new Set([
   'fal.run',                        // fal.ai (video/image, many models)
   'queue.fal.run',                  // fal.ai async queue
   'api.sync.so',                    // Sync.so (lip-sync) — no browser CORS support, must go via relay
+  'api.elevenlabs.io',              // ElevenLabs (alternate voice-clone TTS, incl. Burmese)
 ]);
 
 // Sync.so's presign step hands back a one-time upload URL on ITS storage bucket, not on
@@ -109,8 +110,25 @@ app.post('/relay', async (req, res) => {
 
     const upstream = await fetch(url, fetchOptions);
     const contentType = upstream.headers.get('content-type') || 'application/json';
-    const text = await upstream.text();
 
+    // Most providers here return text/JSON, which the existing text() + res.send(text)
+    // path below handles fine. ElevenLabs' TTS endpoint is the first one that returns
+    // raw binary audio bytes directly (no JSON envelope) — reading that as text() would
+    // corrupt it (binary decoded as UTF-8 loses/mangles bytes). Detect that case and
+    // base64-wrap it in a small JSON envelope instead, so callRelay's existing
+    // text()-then-JSON.parse() client logic keeps working unchanged for every provider,
+    // and only a binary-aware caller needs to know to unwrap { __binary, base64 }.
+    const isBinaryResponse = /^(audio|video|image)\//.test(contentType) || contentType === 'application/octet-stream';
+    if (isBinaryResponse) {
+      const arrayBuffer = await upstream.arrayBuffer();
+      const base64 = Buffer.from(arrayBuffer).toString('base64');
+      res.status(upstream.status);
+      res.set('Content-Type', 'application/json');
+      res.json({ __binary: true, contentType, base64 });
+      return;
+    }
+
+    const text = await upstream.text();
     res.status(upstream.status);
     res.set('Content-Type', contentType);
     res.send(text);
