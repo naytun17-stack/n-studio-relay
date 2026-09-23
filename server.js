@@ -19,7 +19,10 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '25mb' })); // reference photos can be several MB
+// 50mb: base64-encoding a binary upload (Sync.so lip-sync video/audio bytes, forwarded
+// through this relay because the presigned storage bucket has no browser CORS) inflates
+// its size by ~33%, so this needs real headroom beyond the reference-photo case alone.
+app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -47,6 +50,24 @@ const ALLOWED_HOSTS = new Set([
   'api.sync.so',                    // Sync.so (lip-sync) — no browser CORS support, must go via relay
 ]);
 
+// Sync.so's presign step hands back a one-time upload URL on ITS storage bucket, not on
+// api.sync.so itself — the exact hostname is provider-controlled and can vary, so it can't
+// be pinned to a single fixed entry above. That bucket also has no browser CORS (confirmed
+// by a real "Failed to fetch" on a direct PUT), so uploads have to go through this relay
+// too. Rather than allowlisting an unknown arbitrary host, only allow it when it matches a
+// known cloud-storage provider's domain pattern — this keeps the relay from becoming an
+// open proxy while still covering wherever Sync.so's bucket actually lives.
+const ALLOWED_HOST_PATTERNS = [
+  /(^|\.)amazonaws\.com$/,             // AWS S3
+  /(^|\.)storage\.googleapis\.com$/,   // Google Cloud Storage
+  /(^|\.)r2\.cloudflarestorage\.com$/, // Cloudflare R2
+  /(^|\.)digitaloceanspaces\.com$/,    // DigitalOcean Spaces
+  /(^|\.)backblazeb2\.com$/,           // Backblaze B2
+];
+function isHostAllowed(hostname){
+  return ALLOWED_HOSTS.has(hostname) || ALLOWED_HOST_PATTERNS.some(p => p.test(hostname));
+}
+
 // ------------------------------------------------------------
 // MAIN RELAY ENDPOINT
 // The frontend calls THIS endpoint instead of calling providers directly.
@@ -54,7 +75,7 @@ const ALLOWED_HOSTS = new Set([
 // ------------------------------------------------------------
 app.post('/relay', async (req, res) => {
   try {
-    const { url, method, headers, body } = req.body || {};
+    const { url, method, headers, body, bodyEncoding } = req.body || {};
     if (!url) return res.status(400).json({ error: 'Missing url in request body.' });
 
     let hostname;
@@ -64,7 +85,7 @@ app.post('/relay', async (req, res) => {
       return res.status(400).json({ error: 'Invalid url.' });
     }
 
-    if (!ALLOWED_HOSTS.has(hostname)) {
+    if (!isHostAllowed(hostname)) {
       return res.status(403).json({
         error: `Host not allowed: ${hostname}. Add it to ALLOWED_HOSTS in server.js and redeploy.`
       });
@@ -76,7 +97,14 @@ app.post('/relay', async (req, res) => {
       headers: headers || {},
     };
     if (upstreamMethod !== 'GET' && upstreamMethod !== 'HEAD') {
-      fetchOptions.body = typeof body === 'string' ? body : JSON.stringify(body || {});
+      // bodyEncoding:'base64' means `body` is raw binary (e.g. a file upload to a
+      // presigned URL) that got base64-wrapped to survive the JSON envelope — decode it
+      // back to real bytes instead of re-stringifying it as JSON text.
+      if (bodyEncoding === 'base64' && typeof body === 'string') {
+        fetchOptions.body = Buffer.from(body, 'base64');
+      } else {
+        fetchOptions.body = typeof body === 'string' ? body : JSON.stringify(body || {});
+      }
     }
 
     const upstream = await fetch(url, fetchOptions);
